@@ -6,11 +6,11 @@ import { useRouter } from "next/navigation";
 import { ConfirmDialog } from "@/components/ui/ConfirmDialog";
 
 /*
- * Guards in-app navigation while a screen has unsaved changes. The App Router has
- * no route-change event to cancel, so every shell link goes through <GuardedLink>,
- * which asks first when a screen has called useBlockNavigation(true). Other ways of
- * leaving the screen, like signing out, go through useGuardedAction. Tab close and
- * reload are covered separately by useUnsavedChangesWarning.
+- Guards in-app navigation while a screen has unsaved changes. The App Router has
+- no route-change event to cancel, so every shell link goes through <GuardedLink>,
+- which asks first when a screen has called useBlockNavigation(true). Other ways of
+- leaving the screen, like signing out, go through useGuardedAction. Tab close and
+- reload are covered separately by useUnsavedChangesWarning.
  */
 
 interface NavigationGuardApi {
@@ -27,91 +27,68 @@ const NavigationGuardContext = createContext<NavigationGuardApi | null>(null);
 export function NavigationGuardProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const blocked = useRef(false);
-  const isBypassing = useRef(false);
-  const hasGuardEntry = useRef(false);
+  const bypassNextPopState = useRef(false);
+  const guardPushed = useRef(false);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
 
- useEffect(() => {
-    const nav = (window as unknown as { navigation?: EventTarget }).navigation;
-
-    const handleNavigate = (event: Event) => {
-      const navEvent = event as Event & {
-        navigationType?: string;
-        canIntercept?: boolean;
-        destination?: { url?: string };
-        preventDefault: () => void;
-      };
-
-      if (isBypassing.current) {
-        isBypassing.current = false;
-        return;
-      }
-
-      if (blocked.current && navEvent.navigationType === "traverse" && navEvent.canIntercept) {
-        navEvent.preventDefault();
-        
-        // Instead of complex manipulation, trigger the custom confirm dialog only
-        setPendingAction(() => () => {
-          blocked.current = false;
-          isBypassing.current = true;
-          window.history.forward(); // Move forward to cancel the dummy back navigation attempt
-        });
-      }
-    };
-
-    const handlePopState = (event: PopStateEvent) => {
-      if (isBypassing.current) {
-        isBypassing.current = false;
-        return;
-      }
-
-      if (blocked.current) {
-        event.stopImmediatePropagation();
-        
-        // Re-push the current state to temporarily keep the user in place until a decision is made
-        window.history.pushState({ ...window.history.state, guard: true }, "", window.location.href);
-
-        // When Back is pressed, prepare the action for direct redirection to the content page
-        setPendingAction(() => () => {
-          blocked.current = false;
-          isBypassing.current = true;
-          window.location.href = "/content"; // Direct and 100% reliable redirection to the content page
-        });
-      }
-    };
-
-    nav?.addEventListener("navigate", handleNavigate);
-    window.addEventListener("popstate", handlePopState, true);
-
-    return () => {
-      nav?.removeEventListener("navigate", handleNavigate);
-      window.removeEventListener("popstate", handlePopState, true);
-    };
+  const ensureGuardEntry = useCallback(() => {
+    if (typeof window === "undefined" || guardPushed.current) return;
+    window.history.pushState({ __guard: true }, "", window.location.href);
+    guardPushed.current = true;
   }, []);
+
+  const setBlocked = useCallback(
+    (value: boolean) => {
+      blocked.current = value;
+      if (value) {
+        ensureGuardEntry();
+      } else {
+        guardPushed.current = false;
+      }
+    },
+    [ensureGuardEntry],
+  );
+
+  useEffect(() => {
+    const handlePopState = () => {
+      if (bypassNextPopState.current) {
+        bypassNextPopState.current = false;
+        return;
+      }
+
+      if (!blocked.current) return;
+
+      // Keep the user on the same page while he or she decides to enter the Dialog
+      guardPushed.current = false;
+      ensureGuardEntry();
+
+      setPendingAction(() => () => {
+        blocked.current = false;
+        guardPushed.current = false;
+        // We bypass the security entrance we added and take one step back
+        bypassNextPopState.current = true;
+        window.history.go(-2);
+      });
+    };
+
+    window.addEventListener("popstate", handlePopState);
+    return () => window.removeEventListener("popstate", handlePopState);
+  }, [ensureGuardEntry]);
 
   const api = useMemo<NavigationGuardApi>(() => {
     const run = (action: () => void) => {
       // Wrapped, because a function passed to a state setter would be called as an updater.
-      if (blocked.current) {
-        setPendingAction(() => action);
-      } else {
-        action();
-      }
+      if (blocked.current) setPendingAction(() => action);
+      else action();
     };
 
     return {
-      setBlocked: (value) => {
-        if (value && !blocked.current && !hasGuardEntry.current) {
-          window.history.pushState({ ...window.history.state, guard: true }, "", window.location.href);
-          hasGuardEntry.current = true;
-        }
-        blocked.current = value;
-      },
+      setBlocked,
       isBlocked: () => blocked.current,
       navigate: (href) => run(() => router.push(href)),
       run,
     };
-  }, [router]);
+  }, [router, setBlocked]);
 
   return (
     <NavigationGuardContext.Provider value={api}>
@@ -122,20 +99,12 @@ export function NavigationGuardProvider({ children }: { children: React.ReactNod
           message="You have changes that haven’t been saved. Leave anyway?"
           confirmLabel="Discard changes"
           danger
-          onClose={() => {
-            setPendingAction(null);
-          }}
+          onClose={() => setPendingAction(null)}
           onConfirm={() => {
-            // 1. Unblock navigation immediately
-            blocked.current = false;
-            // 2. Set bypass flag
-            isBypassing.current = true;
-            
+            const action = pendingAction;
             setPendingAction(null);
-            
-            // 3. Direct and 100% reliable redirection to the content page
-            router.push("/content");
-  }}
+            action();
+          }}
         />
       )}
     </NavigationGuardContext.Provider>
