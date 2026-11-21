@@ -22,31 +22,67 @@ interface NavigationGuardApi {
   isBlocked: () => boolean;
 }
 
+interface GuardHistoryState {
+  __navGuard?: boolean;
+  [key: string]: unknown;
+}
+
 const NavigationGuardContext = createContext<NavigationGuardApi | null>(null);
+
+function isGuardState(state: unknown): state is GuardHistoryState {
+  return typeof state === "object" && state !== null && Boolean((state as GuardHistoryState).__navGuard);
+}
 
 export function NavigationGuardProvider({ children }: { children: React.ReactNode }) {
   const router = useRouter();
   const blocked = useRef(false);
+  // Skips intercepting the next popstate event caused by programmatic history cleanup/traversal.
   const bypassNextPopState = useRef(false);
-  const guardPushed = useRef(false);
+  // Tracks how many guard history entries were pushed in the current dirty cycle.
+  const guardDepth = useRef(0);
   const [pendingAction, setPendingAction] = useState<(() => void) | null>(null);
 
+  // Ensures a guard entry sits at the top of history so Back/Forward can be intercepted cleanly.
   const ensureGuardEntry = useCallback(() => {
-    if (typeof window === "undefined" || guardPushed.current) return;
-    window.history.pushState({ __guard: true }, "", window.location.href);
-    guardPushed.current = true;
+    if (typeof window === "undefined") return;
+    if (isGuardState(window.history.state)) return;
+
+    const currentState =
+      typeof window.history.state === "object" && window.history.state !== null
+        ? (window.history.state as Record<string, unknown>)
+        : {};
+
+    window.history.pushState({ ...currentState, __navGuard: true }, "", window.location.href);
+    guardDepth.current += 1;
+  }, []);
+
+  // Removes the synthetic guard entry when leaving dirty state (e.g., after Save or unmount)
+  // so subsequent Back clicks do not land on stale guard or /content/new history entries.
+  const cleanupGuardEntry = useCallback(() => {
+    if (typeof window === "undefined") return;
+
+    if (isGuardState(window.history.state) && guardDepth.current > 0) {
+      guardDepth.current = Math.max(0, guardDepth.current - 1);
+      bypassNextPopState.current = true;
+      window.history.back();
+      return;
+    }
+
+    guardDepth.current = 0;
   }, []);
 
   const setBlocked = useCallback(
     (value: boolean) => {
+      const wasBlocked = blocked.current;
       blocked.current = value;
+
       if (value) {
         ensureGuardEntry();
-      } else {
-        guardPushed.current = false;
+      } else if (wasBlocked || guardDepth.current > 0) {
+        cleanupGuardEntry();
       }
     },
-    [ensureGuardEntry],
+    [cleanupGuardEntry, ensureGuardEntry],
   );
 
   useEffect(() => {
@@ -59,15 +95,22 @@ export function NavigationGuardProvider({ children }: { children: React.ReactNod
       if (!blocked.current) return;
 
       // Keep the user on the same page while he or she decides to enter the Dialog
-      guardPushed.current = false;
       ensureGuardEntry();
 
-      setPendingAction(() => () => {
-        blocked.current = false;
-        guardPushed.current = false;
-        // We bypass the security entrance we added and take one step back
-        bypassNextPopState.current = true;
-        window.history.go(-2);
+      // If a dialog is already open from a rapid multi-step Back press, keep the existing pending action
+      // so cancelling preserves unsaved changes and unmounting does not happen.
+      setPendingAction((existing) => {
+        if (existing) return existing;
+
+        return () => {
+          blocked.current = false;
+          // Step past the injected guard entry and the current page entry back to the previous page.
+          const stepsBack = isGuardState(window.history.state) ? -2 : -1;
+          guardDepth.current = 0;
+          // We bypass the security entrance we added and take one step back
+          bypassNextPopState.current = true;
+          window.history.go(stepsBack);
+        };
       });
     };
 
